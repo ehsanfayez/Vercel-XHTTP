@@ -1,27 +1,29 @@
 export const config = { runtime: "edge" };
 
-function normalizeTargetBase(rawTarget) {
-  const raw = (rawTarget || "").trim();
-  if (!raw) return "";
+function sanitizeEndpoint(rawEndpoint) {
+  const candidate = (rawEndpoint || "").trim();
+  if (!candidate) return "";
 
   // Accept "domain:port" style values and default to HTTPS.
-  const withProtocol = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  const withProtocol = /^https?:\/\//i.test(candidate)
+    ? candidate
+    : `https://${candidate}`;
 
   try {
-    const parsed = new URL(withProtocol);
+    const normalizedUrl = new URL(withProtocol);
     // Normalize trailing slashes to avoid accidental double slashes on join.
-    parsed.pathname = parsed.pathname.replace(/\/+$/, "");
-    parsed.search = "";
-    parsed.hash = "";
-    return parsed.toString().replace(/\/$/, "");
+    normalizedUrl.pathname = normalizedUrl.pathname.replace(/\/+$/, "");
+    normalizedUrl.search = "";
+    normalizedUrl.hash = "";
+    return normalizedUrl.toString().replace(/\/$/, "");
   } catch {
     return "";
   }
 }
 
-const TARGET_BASE = normalizeTargetBase(process.env.TARGET_DOMAIN);
+const UPSTREAM_ROOT = sanitizeEndpoint(process.env.UPSTREAM_HOST);
 
-const STRIP_HEADERS = new Set([
+const HOP_BY_HOP_HEADERS = new Set([
   "host",
   "connection",
   "keep-alive",
@@ -37,47 +39,49 @@ const STRIP_HEADERS = new Set([
   "x-forwarded-port",
 ]);
 
-export default async function handler(req) {
-  if (!TARGET_BASE) {
+export default async function edgeRelay(req) {
+  if (!UPSTREAM_ROOT) {
     return new Response(
-      "Misconfigured: TARGET_DOMAIN is missing or invalid. Use e.g. https://xray.example.com:2096",
+      "Misconfigured: UPSTREAM_HOST is missing or invalid. Use e.g. https://xray.example.com:2096",
       { status: 500 }
     );
   }
 
   try {
-    const incomingUrl = new URL(req.url);
-    const targetUrl = `${TARGET_BASE}${incomingUrl.pathname}${incomingUrl.search}`;
+    const sourceUrl = new URL(req.url);
+    const relayUrl = `${UPSTREAM_ROOT}${sourceUrl.pathname}${sourceUrl.search}`;
 
-    const out = new Headers();
-    let clientIp = null;
-    for (const [k, v] of req.headers) {
-      if (STRIP_HEADERS.has(k)) continue;
-      if (k.startsWith("x-vercel-")) continue;
-      if (k === "x-real-ip") {
-        clientIp = v;
+    const forwardedHeaders = new Headers();
+    let requesterIp = null;
+    for (const [headerName, headerValue] of req.headers) {
+      if (HOP_BY_HOP_HEADERS.has(headerName)) continue;
+      if (headerName.startsWith("x-vercel-")) continue;
+      if (headerName === "x-real-ip") {
+        requesterIp = headerValue;
         continue;
       }
-      if (k === "x-forwarded-for") {
-        if (!clientIp) clientIp = v;
+      if (headerName === "x-forwarded-for") {
+        if (!requesterIp) requesterIp = headerValue;
         continue;
       }
-      out.set(k, v);
+      forwardedHeaders.set(headerName, headerValue);
     }
-    if (clientIp) out.set("x-forwarded-for", clientIp);
+    if (requesterIp) forwardedHeaders.set("x-forwarded-for", requesterIp);
 
-    const method = req.method;
-    const hasBody = method !== "GET" && method !== "HEAD";
+    const httpMethod = req.method;
+    const shouldProxyBody = httpMethod !== "GET" && httpMethod !== "HEAD";
 
-    return await fetch(targetUrl, {
-      method,
-      headers: out,
-      body: hasBody ? req.body : undefined,
+    return await fetch(relayUrl, {
+      method: httpMethod,
+      headers: forwardedHeaders,
+      body: shouldProxyBody ? req.body : undefined,
       redirect: "manual",
     });
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error("relay error:", message);
-    return new Response(`Bad Gateway: Tunnel Failed (${message})`, { status: 502 });
+  } catch (cause) {
+    const errorText = cause instanceof Error ? cause.message : String(cause);
+    console.error("relay error:", errorText);
+    return new Response(`Bad Gateway: Tunnel Failed (${errorText})`, {
+      status: 502,
+    });
   }
 }
